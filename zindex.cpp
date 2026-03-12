@@ -1,5 +1,5 @@
 /*
-    zindex.cpp — tiny searcher over chunked .tar.zst archives.
+    zindex.cpp — tiny searcher over chunked .tar.zst archives in 1337 lines.
 
     Archives are stored as concatenated independent zstd frames. Each
     archive has a sibling JSON file named <archive>.json with per-frame
