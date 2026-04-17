@@ -56,11 +56,13 @@ extern "C"
 typedef struct
 {
   const char *pat;
+  const char *fold_pat;
   size_t len;
   int bad[ASCII_SET_SIZE];
+  int bad_fold[ASCII_SET_SIZE];
+  size_t max_hits;
+  bool case_insensitive;
 } PatCtx;
-
-static PatCtx g_pat;
 
 static void build_badchar_table(const char *pattern, size_t patLen, int bad[ASCII_SET_SIZE])
 {
@@ -70,6 +72,11 @@ static void build_badchar_table(const char *pattern, size_t patLen, int bad[ASCI
     bad[i] = (int)patLen;
   for (size_t i = 0; i + 1 < patLen; i++)
     bad[(unsigned char)pattern[i]] = (int)(patLen - 1 - i);
+}
+
+static inline unsigned char ascii_tolower_byte(unsigned char c)
+{
+  return (c >= 'A' && c <= 'Z') ? (unsigned char)(c + ('a' - 'A')) : c;
 }
 
 static inline bool bytes_equal(const char *a, const char *b, size_t len)
@@ -96,12 +103,21 @@ static inline bool bytes_equal(const char *a, const char *b, size_t len)
 #endif
 }
 
-static inline ssize_t BMH_find(const char *hay, size_t hayLen,
-                               const char *pat, size_t patLen,
-                               const int bad[256])
+static inline bool bytes_equal_fold(const char *a, const char *b, size_t len)
 {
-  if (!hay || !pat || patLen == 0 || hayLen < patLen)
+  for (size_t i = 0; i < len; ++i)
+    if (ascii_tolower_byte((unsigned char)a[i]) != (unsigned char)b[i])
+      return false;
+  return true;
+}
+
+static inline ssize_t BMH_find(const char *hay, size_t hayLen, const PatCtx *ctx)
+{
+  if (!hay || !ctx || !ctx->pat || ctx->len == 0 || hayLen < ctx->len)
     return -1;
+  const size_t patLen = ctx->len;
+  const char *pat = ctx->case_insensitive ? ctx->fold_pat : ctx->pat;
+  const int *bad = ctx->case_insensitive ? ctx->bad_fold : ctx->bad;
   if (patLen <= MEMCHR_HYBRID_MAX)
   {
     const char *base = hay;
@@ -109,11 +125,23 @@ static inline ssize_t BMH_find(const char *hay, size_t hayLen,
     const unsigned char first = (unsigned char)pat[0];
     while (hay < limit)
     {
-      const void *found = memchr(hay, first, (size_t)(limit - hay));
-      if (!found)
-        return -1;
-      const char *cand = (const char *)found;
-      if (patLen == 1 || bytes_equal(cand + 1, pat + 1, patLen - 1))
+      const char *cand = hay;
+      if (!ctx->case_insensitive)
+      {
+        const void *found = memchr(hay, first, (size_t)(limit - hay));
+        if (!found)
+          return -1;
+        cand = (const char *)found;
+      }
+      else
+      {
+        while (cand < limit && ascii_tolower_byte((unsigned char)*cand) != first)
+          ++cand;
+        if (cand >= limit)
+          return -1;
+      }
+      if (patLen == 1 || (ctx->case_insensitive ? bytes_equal_fold(cand + 1, pat + 1, patLen - 1)
+                                                : bytes_equal(cand + 1, pat + 1, patLen - 1)))
         return (ssize_t)(cand - base);
       hay = cand + 1;
     }
@@ -125,16 +153,22 @@ static inline ssize_t BMH_find(const char *hay, size_t hayLen,
     bool match = false;
     if (patLen <= 16)
     {
-      match = bytes_equal(hay + i, pat, patLen);
+      match = ctx->case_insensitive ? bytes_equal_fold(hay + i, pat, patLen)
+                                    : bytes_equal(hay + i, pat, patLen);
     }
     else
     {
-      if (bytes_equal(hay + i + patLen - 16, pat + patLen - 16, 16))
-        match = bytes_equal(hay + i, pat, patLen);
+      bool tail_match = ctx->case_insensitive ? bytes_equal_fold(hay + i + patLen - 16, pat + patLen - 16, 16)
+                                              : bytes_equal(hay + i + patLen - 16, pat + patLen - 16, 16);
+      if (tail_match)
+        match = ctx->case_insensitive ? bytes_equal_fold(hay + i, pat, patLen)
+                                      : bytes_equal(hay + i, pat, patLen);
     }
     if (match)
       return (ssize_t)i;
-    unsigned char last = (unsigned char)hay[i + patLen - 1];
+    unsigned char last = ctx->case_insensitive
+                             ? ascii_tolower_byte((unsigned char)hay[i + patLen - 1])
+                             : (unsigned char)hay[i + patLen - 1];
     int shift = bad[last];
     i += (shift > 0) ? shift : 1;
   }
@@ -144,7 +178,6 @@ static inline ssize_t BMH_find(const char *hay, size_t hayLen,
 typedef struct
 {
   char filename[MAX_FILENAME_LEN];
-  char internalFilename[MAX_FILENAME_LEN];
   int64_t offset;
   char preview[MAX_LINE_PREVIEW];
 } SearchResult;
@@ -307,7 +340,7 @@ static void *printer_thread(void *arg)
   setvbuf(stdout, NULL, _IOFBF, 1 << 20);
   while (printqueue_pop(q, &sr))
   {
-    int n = snprintf(line, sizeof(line), "%s\n", sr.preview);
+    int n = snprintf(line, sizeof(line), "%s:%lld:%s\n", sr.filename, (long long)sr.offset, sr.preview);
     if (n > 0)
       (void)fwrite(line, 1, (size_t)n, stdout);
   }
@@ -325,7 +358,7 @@ static void make_preview(const char *text, size_t textLen,
     return;
   }
   size_t start = matchPos, end = matchPos;
-  while (start > 0 && text[start - 1] != '\n')
+  while (start > 0 && text[start - 1] != '\n' && text[start - 1] != '\0')
     --start;
   while (end < textLen && text[end] != '\n' && text[end] != '\0')
     ++end;
@@ -334,29 +367,6 @@ static void make_preview(const char *text, size_t textLen,
     len = MAX_LINE_PREVIEW - 1;
   memcpy(outRes->preview, text + start, len);
   outRes->preview[len] = '\0';
-  outRes->internalFilename[0] = '\0';
-  const char *exts[] = {".txt", ".csv", ".json", ".md", ".log", NULL};
-  for (int i = 0; exts[i]; ++i)
-  {
-    char *pos = strstr(outRes->preview, exts[i]);
-    if (!pos)
-      continue;
-    char *begin = pos;
-    while (begin > outRes->preview)
-    {
-      char c = *(begin - 1);
-      if (c == ' ' || c == '/' || c == '\\' || c == ':')
-        break;
-      --begin;
-    }
-    size_t fLen = (size_t)(pos - begin + strlen(exts[i]));
-    if (fLen && fLen < MAX_FILENAME_LEN)
-    {
-      strncpy(outRes->internalFilename, begin, fLen);
-      outRes->internalFilename[fLen] = '\0';
-    }
-    break;
-  }
 }
 
 typedef struct
@@ -808,22 +818,22 @@ static void search_in_buffer(PrintQueue *pq,
 {
   if (!pq || !text || !ctx || !ctx->pat || ctx->len == 0 || textLen < ctx->len)
     return;
-  const int *bad = ctx->bad;
+  const size_t max_hits = ctx->max_hits;
+  if (max_hits == 0)
+    return;
   const size_t plen = ctx->len;
-  const char *pat = ctx->pat;
   size_t offset = 0;
   size_t hits = 0;
-  const size_t MAX_HITS = 1000;
-  while (offset + plen <= textLen && hits < MAX_HITS)
+  while (offset + plen <= textLen && hits < max_hits)
   {
-    ssize_t rel = BMH_find(text + offset, textLen - offset, pat, plen, bad);
+    ssize_t rel = BMH_find(text + offset, textLen - offset, ctx);
     if (rel < 0)
       break;
     size_t pos = offset + (size_t)rel;
     SearchResult sr = {};
     strncpy(sr.filename, filename, sizeof(sr.filename) - 1);
     sr.offset = baseOff + (int64_t)pos;
-    make_preview(text, textLen, pos, plen, pat, &sr);
+    make_preview(text, textLen, pos, plen, ctx->pat, &sr);
     if (sr.preview[0] != '\0')
     {
       if (!result_batch_add(pq, batch, &sr))
@@ -835,7 +845,7 @@ static void search_in_buffer(PrintQueue *pq,
     }
     offset = pos + 1;
   }
-  if (hits == MAX_HITS)
+  if (hits == max_hits)
     fprintf(stderr, "[warn] hit cap reached for buffer in %s at offset %lld; truncating additional matches\n",
             filename ? filename : "(unknown)", (long long)baseOff);
 }
@@ -1042,6 +1052,7 @@ typedef struct
 {
   const char **zstFiles;
   const char **idxFiles;
+  const PatCtx *pat;
   int fileCount;
   int start, end;
   PrintQueue *pqueue;
@@ -1055,7 +1066,7 @@ static void *worker_thread(void *arg)
   ResultBatch batch = {};
   
   // Allocate reusable buffers once per thread
-  const size_t OVER = (g_pat.len > 1) ? (g_pat.len - 1) : 0;
+  const size_t OVER = (W->pat->len > 1) ? (W->pat->len - 1) : 0;
   char *buf = (char *)malloc(ZSTD_OUT_WIN + OVER);
   char *inbuf = (char *)malloc(ZSTD_IN_CHUNK);
   ZSTD_DCtx *dctx = ZSTD_createDCtx();
@@ -1073,7 +1084,7 @@ static void *worker_thread(void *arg)
   {
     if (!W->zstFiles[i] || !W->idxFiles[i])
       continue;
-    search_indexed_file(W->pqueue, &batch, W->zstFiles[i], W->idxFiles[i], &g_pat, buf, inbuf, dctx);
+    search_indexed_file(W->pqueue, &batch, W->zstFiles[i], W->idxFiles[i], W->pat, buf, inbuf, dctx);
   }
   (void)result_batch_flush(W->pqueue, &batch);
   
@@ -1105,39 +1116,139 @@ static char* build_path(const char *dir, const char *file)
   return path;
 }
 
+static bool grow_file_arrays(char ***zst, char ***idx, size_t old_cap, size_t new_cap)
+{
+  char **new_zst = (char **)malloc(new_cap * sizeof(*new_zst));
+  char **new_idx = (char **)malloc(new_cap * sizeof(*new_idx));
+  if (!new_zst || !new_idx)
+  {
+    free(new_zst);
+    free(new_idx);
+    return false;
+  }
+  if (old_cap > 0)
+  {
+    memcpy(new_zst, *zst, old_cap * sizeof(*new_zst));
+    memcpy(new_idx, *idx, old_cap * sizeof(*new_idx));
+  }
+  free(*zst);
+  free(*idx);
+  *zst = new_zst;
+  *idx = new_idx;
+  return true;
+}
+
+typedef struct
+{
+  char *zst;
+  char *idx;
+} ArchivePair;
+
+static int compare_archive_pairs(const void *lhs, const void *rhs)
+{
+  const ArchivePair *a = (const ArchivePair *)lhs;
+  const ArchivePair *b = (const ArchivePair *)rhs;
+  return strcmp(a->zst, b->zst);
+}
+
+static bool sort_file_pairs(char **zst, char **idx, size_t count)
+{
+  if (count < 2)
+    return true;
+  ArchivePair *pairs = (ArchivePair *)malloc(count * sizeof(*pairs));
+  if (!pairs)
+    return false;
+  for (size_t i = 0; i < count; ++i)
+  {
+    pairs[i].zst = zst[i];
+    pairs[i].idx = idx[i];
+  }
+  qsort(pairs, count, sizeof(*pairs), compare_archive_pairs);
+  for (size_t i = 0; i < count; ++i)
+  {
+    zst[i] = pairs[i].zst;
+    idx[i] = pairs[i].idx;
+  }
+  free(pairs);
+  return true;
+}
+
 int main(int argc, char **argv)
 {
   const char *search_dir = ".";
   const char *pattern = NULL;
+  bool dir_set_via_flag = false;
+  bool case_insensitive = false;
+  size_t max_hits = 1000;
+  PatCtx pat = {};
+  char *folded_pattern = NULL;
   
   // Parse command line arguments
   int opt;
-  while ((opt = getopt(argc, argv, "d:h")) != -1)
+  while ((opt = getopt(argc, argv, "d:im:h")) != -1)
   {
     switch (opt)
     {
     case 'd':
       search_dir = optarg;
+      dir_set_via_flag = true;
       break;
+    case 'i':
+      case_insensitive = true;
+      break;
+    case 'm':
+    {
+      char *end = NULL;
+      errno = 0;
+      unsigned long long parsed = strtoull(optarg, &end, 10);
+      if (errno != 0 || !end || *end != '\0')
+      {
+        fprintf(stderr, "Invalid hit limit: %s\n", optarg);
+        return 1;
+      }
+      max_hits = (size_t)parsed;
+      break;
+    }
     case 'h':
-      fprintf(stderr, "Usage: %s [-d directory] <pattern>\n", argv[0]);
+      fprintf(stderr, "Usage: %s [-d directory] [-i] [-m limit] <pattern>\n", argv[0]);
+      fprintf(stderr, "       %s [directory] <pattern>\n", argv[0]);
       fprintf(stderr, "  -d directory  Directory to search (default: current directory)\n");
-      fprintf(stderr, "  -h           Show this help message\n");
+      fprintf(stderr, "  -i            Case-insensitive search\n");
+      fprintf(stderr, "  -m limit      Max hits per searched buffer (default: 1000)\n");
+      fprintf(stderr, "  directory     Optional positional search directory\n");
+      fprintf(stderr, "  -h            Show this help message\n");
       return 0;
     default:
-      fprintf(stderr, "Usage: %s [-d directory] <pattern>\n", argv[0]);
+      fprintf(stderr, "Usage: %s [-d directory] [-i] [-m limit] <pattern>\n", argv[0]);
+      fprintf(stderr, "       %s [directory] <pattern>\n", argv[0]);
       return 1;
     }
   }
   
-  // Get the pattern from remaining arguments
-  if (optind >= argc)
+  // Accept either "<pattern>" or "[directory] <pattern>" after options.
+  int remaining = argc - optind;
+  if (remaining <= 0)
   {
     fprintf(stderr, "Error: No search pattern specified\n");
-    fprintf(stderr, "Usage: %s [-d directory] <pattern>\n", argv[0]);
+    fprintf(stderr, "Usage: %s [-d directory] [-i] [-m limit] <pattern>\n", argv[0]);
+    fprintf(stderr, "       %s [directory] <pattern>\n", argv[0]);
     return 1;
   }
-  pattern = argv[optind];
+  if (remaining == 1)
+  {
+    pattern = argv[optind];
+  }
+  else if (remaining == 2 && !dir_set_via_flag)
+  {
+    search_dir = argv[optind];
+    pattern = argv[optind + 1];
+  }
+  else
+  {
+    fprintf(stderr, "Usage: %s [-d directory] [-i] [-m limit] <pattern>\n", argv[0]);
+    fprintf(stderr, "       %s [directory] <pattern>\n", argv[0]);
+    return 1;
+  }
   
   const size_t patLen = strlen(pattern);
   if (!patLen)
@@ -1159,9 +1270,29 @@ int main(int argc, char **argv)
     return 1;
   }
 
-  g_pat.pat = pattern;
-  g_pat.len = patLen;
-  build_badchar_table(g_pat.pat, g_pat.len, g_pat.bad);
+  pat.pat = pattern;
+  pat.len = patLen;
+  pat.max_hits = max_hits;
+  pat.case_insensitive = case_insensitive;
+  build_badchar_table(pat.pat, pat.len, pat.bad);
+  if (pat.case_insensitive)
+  {
+    folded_pattern = (char *)malloc(patLen + 1);
+    if (!folded_pattern)
+    {
+      fprintf(stderr, "OOM\n");
+      return 1;
+    }
+    for (size_t i = 0; i < patLen; ++i)
+      folded_pattern[i] = (char)ascii_tolower_byte((unsigned char)pattern[i]);
+    folded_pattern[patLen] = '\0';
+    pat.fold_pat = folded_pattern;
+    build_badchar_table(pat.fold_pat, pat.len, pat.bad_fold);
+  }
+  else
+  {
+    pat.fold_pat = pat.pat;
+  }
 
   DIR *d = opendir(search_dir);
   if (!d)
@@ -1180,6 +1311,7 @@ int main(int argc, char **argv)
       free(zst);
     if (idx)
       free(idx);
+    free(folded_pattern);
     closedir(d);
     return 1;
   }
@@ -1220,10 +1352,8 @@ int main(int argc, char **argv)
       {
         if (count >= cap)
         {
-          cap *= 2;
-          char **nz = (char **)realloc(zst, cap * sizeof(*nz));
-          char **ni = (char **)realloc(idx, cap * sizeof(*ni));
-          if (!nz || !ni)
+          size_t new_cap = cap * 2;
+          if (!grow_file_arrays(&zst, &idx, cap, new_cap))
           {
             fprintf(stderr, "realloc failed\n");
             free(zstPath);
@@ -1235,11 +1365,11 @@ int main(int argc, char **argv)
             }
             free(zst);
             free(idx);
+            free(folded_pattern);
             closedir(d);
             return 1;
           }
-          zst = nz;
-          idx = ni;
+          cap = new_cap;
         }
         zst[count] = zstPath;
         idx[count] = idxPath;
@@ -1259,7 +1389,22 @@ int main(int argc, char **argv)
     fprintf(stderr, "No *.tar.zst + *.tar.zst.json pairs found in directory: %s\n", search_dir);
     free(zst);
     free(idx);
+    free(folded_pattern);
     return 0;
+  }
+
+  if (!sort_file_pairs(zst, idx, count))
+  {
+    fprintf(stderr, "OOM\n");
+    for (size_t i = 0; i < count; i++)
+    {
+      free(zst[i]);
+      free(idx[i]);
+    }
+    free(zst);
+    free(idx);
+    free(folded_pattern);
+    return 1;
   }
 
   PrintQueue pq;
@@ -1276,6 +1421,7 @@ int main(int argc, char **argv)
     }
     free(zst);
     free(idx);
+    free(folded_pattern);
     printqueue_destroy(&pq);
     return 1;
   }
@@ -1294,6 +1440,7 @@ int main(int argc, char **argv)
     }
     free(zst);
     free(idx);
+    free(folded_pattern);
     printqueue_destroy(&pq);
     return 1;
   }
@@ -1304,6 +1451,7 @@ int main(int argc, char **argv)
     int load = per + (t < rem ? 1 : 0);
     args[t].zstFiles = (const char **)zst;
     args[t].idxFiles = (const char **)idx;
+    args[t].pat = &pat;
     args[t].fileCount = (int)count;
     args[t].start = start;
     args[t].end = start + load;
@@ -1332,6 +1480,7 @@ int main(int argc, char **argv)
   free(zst);
   free(idx);
   free(args);
+  free(folded_pattern);
   printqueue_destroy(&pq);
   return 0;
 }
